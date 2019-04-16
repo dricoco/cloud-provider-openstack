@@ -33,7 +33,11 @@ VERSION ?= $(shell git describe --exact-match 2> /dev/null || \
 GOFLAGS   :=
 TAGS      :=
 LDFLAGS   := "-w -s -X 'main.version=${VERSION}'"
-REGISTRY ?= k8scloudprovider
+#REGISTRY ?= k8scloudprovider
+REGISTRY ?= registry.gitlab.ows.fr/public-project/cloud-provider-openstack
+DOCKER_USERNAME = root
+DOCKER_PASSWORD = gitgitlablab
+
 
 ifneq ("$(DEST)", "$(PWD)")
     $(error Please run 'make' from $(DEST). Current directory is $(PWD))
@@ -275,13 +279,13 @@ endif
 
 upload-images: images
 	@echo "push images to $(REGISTRY)"
-	docker login -u="$(DOCKER_USERNAME)" -p="$(DOCKER_PASSWORD)";
-	docker push $(REGISTRY)/openstack-cloud-controller-manager:$(VERSION)
+	docker login registry.gitlab.ows.fr -u="$(DOCKER_USERNAME)" -p="$(DOCKER_PASSWORD)";
+	#docker push $(REGISTRY)/openstack-cloud-controller-manager:$(VERSION)
 	docker push $(REGISTRY)/cinder-flex-volume-driver:$(VERSION)
 	docker push $(REGISTRY)/cinder-provisioner:$(VERSION)
 	docker push $(REGISTRY)/cinder-csi-plugin:$(VERSION)
 	docker push $(REGISTRY)/k8s-keystone-auth:$(VERSION)
-	docker push $(REGISTRY)/octavia-ingress-controller:$(VERSION)
+	#docker push $(REGISTRY)/octavia-ingress-controller:$(VERSION)
 	docker push $(REGISTRY)/manila-provisioner:$(VERSION)
 
 version:

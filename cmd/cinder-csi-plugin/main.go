@@ -35,12 +35,12 @@ var (
 	cluster     string
 )
 
-func init() {
-	flag.Set("logtostderr", "true")
-}
+//func init() {
+//}
 
 func main() {
 
+	flag.Set("logtostderr", "true")
 	flag.CommandLine.Parse([]string{})
 
 	cmd := &cobra.Command{
