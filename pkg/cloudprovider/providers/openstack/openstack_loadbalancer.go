@@ -40,7 +40,7 @@ import (
 	neutronports "github.com/gophercloud/gophercloud/openstack/networking/v2/ports"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/subnets"
 	"github.com/gophercloud/gophercloud/pagination"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -73,20 +73,24 @@ const (
 	activeStatus = "ACTIVE"
 	errorStatus  = "ERROR"
 
-	ServiceAnnotationLoadBalancerFloatingNetworkID = "loadbalancer.openstack.org/floating-network-id"
-	ServiceAnnotationLoadBalancerFloatingSubnet    = "loadbalancer.openstack.org/floating-subnet"
-	ServiceAnnotationLoadBalancerFloatingSubnetID  = "loadbalancer.openstack.org/floating-subnet-id"
-	ServiceAnnotationLoadBalancerSubnetID          = "loadbalancer.openstack.org/subnet-id"
-	ServiceAnnotationLoadBalancerPortID            = "loadbalancer.openstack.org/port-id"
-	ServiceAnnotationLoadBalancerConnLimit         = "loadbalancer.openstack.org/connection-limit"
-	ServiceAnnotationLoadBalancerKeepFloatingIP    = "loadbalancer.openstack.org/keep-floatingip"
-	ServiceAnnotationLoadBalancerProxyEnabled      = "loadbalancer.openstack.org/proxy-protocol"
-	ServiceAnnotationLoadBalancerXForwardedFor     = "loadbalancer.openstack.org/x-forwarded-for"
+	ServiceAnnotationLoadBalancerConnLimit            = "loadbalancer.openstack.org/connection-limit"
+	ServiceAnnotationLoadBalancerFloatingNetworkID    = "loadbalancer.openstack.org/floating-network-id"
+	ServiceAnnotationLoadBalancerFloatingSubnet       = "loadbalancer.openstack.org/floating-subnet"
+	ServiceAnnotationLoadBalancerFloatingSubnetID     = "loadbalancer.openstack.org/floating-subnet-id"
+	ServiceAnnotationLoadBalancerInternal             = "service.beta.kubernetes.io/openstack-internal-load-balancer"
+	ServiceAnnotationLoadBalancerKeepFloatingIP       = "loadbalancer.openstack.org/keep-floatingip"
+	ServiceAnnotationLoadBalancerPortID               = "loadbalancer.openstack.org/port-id"
+	ServiceAnnotationLoadBalancerProxyEnabled         = "loadbalancer.openstack.org/proxy-protocol"
+	ServiceAnnotationLoadBalancerSubnetID             = "loadbalancer.openstack.org/subnet-id"
+	ServiceAnnotationLoadBalancerTimeoutClientData    = "loadbalancer.openstack.org/timeout-client-data"
+	ServiceAnnotationLoadBalancerTimeoutMemberConnect = "loadbalancer.openstack.org/timeout-member-connect"
+	ServiceAnnotationLoadBalancerTimeoutMemberData    = "loadbalancer.openstack.org/timeout-member-data"
+	ServiceAnnotationLoadBalancerTimeoutTCPInspect    = "loadbalancer.openstack.org/timeout-tcp-inspect"
+	ServiceAnnotationLoadBalancerXForwardedFor        = "loadbalancer.openstack.org/x-forwarded-for"
 
 	// ServiceAnnotationLoadBalancerInternal is the annotation used on the service
 	// to indicate that we want an internal loadbalancer service.
 	// If the value of ServiceAnnotationLoadBalancerInternal is false, it indicates that we want an external loadbalancer service. Default to false.
-	ServiceAnnotationLoadBalancerInternal = "service.beta.kubernetes.io/openstack-internal-load-balancer"
 )
 
 // LbaasV2 is a LoadBalancer implementation for Neutron LBaaS v2 API
@@ -171,7 +175,10 @@ func getLoadBalancers(client *gophercloud.ServiceClient, opts loadbalancers.List
 	return allLoadbalancers, nil
 }
 
+// getLoadbalancerByName get the load balancer which is in valid status by the given name/legacy name.
 func getLoadbalancerByName(client *gophercloud.ServiceClient, name string, legacyName string) (*loadbalancers.LoadBalancer, error) {
+	var validLBs []loadbalancers.LoadBalancer
+
 	opts := loadbalancers.ListOpts{
 		Name: name,
 	}
@@ -180,13 +187,9 @@ func getLoadbalancerByName(client *gophercloud.ServiceClient, name string, legac
 		return nil, err
 	}
 
-	if len(allLoadbalancers) > 1 {
-		return nil, ErrMultipleResults
-	}
-
 	if len(allLoadbalancers) == 0 {
 		if len(legacyName) > 0 {
-			// Try to get load balnacer by legacy name.
+			// Backoff to get load balnacer by legacy name.
 			opts := loadbalancers.ListOpts{
 				Name: legacyName,
 			}
@@ -194,19 +197,26 @@ func getLoadbalancerByName(client *gophercloud.ServiceClient, name string, legac
 			if err != nil {
 				return nil, err
 			}
-
-			if len(allLoadbalancers) > 1 {
-				return nil, ErrMultipleResults
-			}
-			if len(allLoadbalancers) == 0 {
-				return nil, ErrNotFound
-			}
 		} else {
 			return nil, ErrNotFound
 		}
 	}
 
-	return &allLoadbalancers[0], nil
+	for _, lb := range allLoadbalancers {
+		// All the ProvisioningStatus could be found here https://developer.openstack.org/api-ref/load-balancer/v2/index.html#provisioning-status-codes
+		if lb.ProvisioningStatus != "DELETED" && lb.ProvisioningStatus != "PENDING_DELETE" {
+			validLBs = append(validLBs, lb)
+		}
+	}
+
+	if len(validLBs) > 1 {
+		return nil, ErrMultipleResults
+	}
+	if len(validLBs) == 0 {
+		return nil, ErrNotFound
+	}
+
+	return &validLBs[0], nil
 }
 
 func getListenersByLoadBalancerID(client *gophercloud.ServiceClient, id string) ([]listeners.Listener, error) {
@@ -587,6 +597,18 @@ func getStringFromServiceAnnotation(service *v1.Service, annotationKey string, d
 	return defaultSetting
 }
 
+func getIntFromServiceAnnotation(service *v1.Service, annotationKey string) (int, bool) {
+	intString := getStringFromServiceAnnotation(service, annotationKey, "")
+	if len(intString) > 0 {
+		annotationValue, err := strconv.Atoi(intString)
+		if err == nil {
+			klog.V(4).Infof("Found a Service Annotation: %v = %v", annotationKey, annotationValue)
+			return annotationValue, true
+		}
+	}
+	return 0, false
+}
+
 //getBoolFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's value or a specified defaultSetting
 func getBoolFromServiceAnnotation(service *v1.Service, annotationKey string, defaultSetting bool) (bool, error) {
 	klog.V(4).Infof("getBoolFromServiceAnnotation(%v, %v, %v)", service, annotationKey, defaultSetting)
@@ -914,7 +936,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 
 	provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+		return nil, fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE, current provisioning status %s", provisioningStatus)
 	}
 
 	lbmethod := v2pools.LBMethod(lbaas.opts.LBMethod)
@@ -955,6 +977,20 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 				ConnLimit:      &connLimit,
 				LoadbalancerID: loadbalancer.ID,
 			}
+
+			if timeoutClientData, ok := getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutClientData); ok {
+				listenerCreateOpt.TimeoutClientData = &timeoutClientData
+			}
+			if timeoutMemberData, ok := getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutMemberData); ok {
+				listenerCreateOpt.TimeoutMemberData = &timeoutMemberData
+			}
+			if timeoutMemberConnect, ok := getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutMemberConnect); ok {
+				listenerCreateOpt.TimeoutMemberConnect = &timeoutMemberConnect
+			}
+			if timeoutTCPInspect, ok := getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutTCPInspect); ok {
+				listenerCreateOpt.TimeoutTCPInspect = &timeoutTCPInspect
+			}
+
 			if keepClientIP {
 				listenerCreateOpt.InsertHeaders = map[string]string{"X-Forwarded-For": "true"}
 			}
@@ -968,7 +1004,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 			}
 			provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 			if err != nil {
-				return nil, fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+				return nil, fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after creating listener, current provisioning status %s", provisioningStatus)
 			}
 		} else {
 			if connLimit != listener.ConnLimit {
@@ -985,7 +1021,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 
 				provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 				if err != nil {
-					return nil, fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+					return nil, fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after updating listener, current provisioning status %s", provisioningStatus)
 				}
 			}
 		}
@@ -1033,7 +1069,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 			}
 			provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 			if err != nil {
-				return nil, fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+				return nil, fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after creating pool, current provisioning status %s", provisioningStatus)
 			}
 
 		}
@@ -1070,7 +1106,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 
 				provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 				if err != nil {
-					return nil, fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+					return nil, fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after creating member, current provisioning status %s", provisioningStatus)
 				}
 			} else {
 				// After all members have been processed, remaining members are deleted as obsolete.
@@ -1089,7 +1125,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 			}
 			provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 			if err != nil {
-				return nil, fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+				return nil, fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after deleting member, current provisioning status %s", provisioningStatus)
 			}
 		}
 
@@ -1109,7 +1145,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 			}
 			provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 			if err != nil {
-				return nil, fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+				return nil, fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after creating monitor, current provisioning status %s", provisioningStatus)
 			}
 			monitorID = monitor.ID
 		} else if lbaas.opts.CreateMonitor == false {
@@ -1140,7 +1176,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 				}
 				provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 				if err != nil {
-					return nil, fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+					return nil, fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after deleting monitor, current provisioning status %s", provisioningStatus)
 				}
 			}
 			// get and delete pool members
@@ -1157,7 +1193,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 					}
 					provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 					if err != nil {
-						return nil, fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+						return nil, fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after deleting member, current provisioning status %s", provisioningStatus)
 					}
 				}
 			}
@@ -1169,7 +1205,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 			}
 			provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 			if err != nil {
-				return nil, fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+				return nil, fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after deleting pool, current provisioning status %s", provisioningStatus)
 			}
 		}
 		// delete listener
@@ -1179,7 +1215,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 		}
 		provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+			return nil, fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after deleting listener, current provisioning status %s", provisioningStatus)
 		}
 		klog.V(2).Infof("Deleted obsolete listener: %s", listener.ID)
 	}
@@ -1205,9 +1241,8 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 					floatIP, err = floatingips.Update(lbaas.network, floatingip.ID, floatUpdateOpts).Extract()
 					if err != nil {
 						return nil, fmt.Errorf("error updating LB floatingip %+v: %v", floatUpdateOpts, err)
-					} else {
-						needCreate = false
 					}
+					needCreate = false
 				} else {
 					return nil, fmt.Errorf("floatingip is attached already to another port")
 				}
@@ -1626,7 +1661,7 @@ func (lbaas *LbaasV2) UpdateLoadBalancer(ctx context.Context, clusterName string
 			}
 			provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 			if err != nil {
-				return fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+				return fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after creating member, current provisioning status %s", provisioningStatus)
 			}
 		}
 
@@ -1642,7 +1677,7 @@ func (lbaas *LbaasV2) UpdateLoadBalancer(ctx context.Context, clusterName string
 			}
 			provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 			if err != nil {
-				return fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+				return fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after deleting member, current provisioning status %s", provisioningStatus)
 			}
 		}
 	}
@@ -1812,7 +1847,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(ctx context.Context, clusterName
 			}
 			provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 			if err != nil {
-				return fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+				return fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after deleting monitor, current provisioning status %s", provisioningStatus)
 			}
 		}
 
@@ -1831,7 +1866,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(ctx context.Context, clusterName
 				}
 				provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 				if err != nil {
-					return fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+					return fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after deleting member, current provisioning status %s", provisioningStatus)
 				}
 			}
 
@@ -1842,7 +1877,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(ctx context.Context, clusterName
 			}
 			provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 			if err != nil {
-				return fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+				return fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after deleting pool, current provisioning status %s", provisioningStatus)
 			}
 		}
 
@@ -1854,7 +1889,7 @@ func (lbaas *LbaasV2) EnsureLoadBalancerDeleted(ctx context.Context, clusterName
 			}
 			provisioningStatus, err := waitLoadbalancerActiveProvisioningStatus(lbaas.lb, loadbalancer.ID)
 			if err != nil {
-				return fmt.Errorf("failed to loadbalance ACTIVE provisioning status %v: %v", provisioningStatus, err)
+				return fmt.Errorf("timeout when waiting for loadbalancer to be ACTIVE after deleting listener, current provisioning status %s", provisioningStatus)
 			}
 		}
 
